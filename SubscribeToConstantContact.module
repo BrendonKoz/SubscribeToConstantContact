@@ -1,0 +1,988 @@
+<?php namespace ProcessWire;
+
+class SubscribeToConstantContact extends WireData implements Module, ConfigurableModule {
+
+    // TODO: Clean up the code, remove duplication, etc.
+
+    const WARNING_VALIDATION = "A user managed to send a form without an email address. Please check your form validation! Serverside validation is expected.";
+    const CTCT_AUTH_URL      = 'https://authz.constantcontact.com/oauth2/default/v1/authorize';
+    const CTCT_TOKEN_URL     = 'https://authz.constantcontact.com/oauth2/default/v1/token';
+    const CTCT_SCOPES        = ['offline_access', 'contact_data']; // 'offline_access' is required to retrieve a refresh token
+    const API_BASE           = 'https://api.cc.email/v3';
+    public $errorMessage     = null;
+
+    /**
+     * Generates the URL needed to authorize this module as a client application
+     * @param string $clientId Client API key as retrieved from the developer portal
+     * @param string $redirectURI A web accessible URL to return to for reverse validation
+     * @param string $scope Level of access to the primary account being granted to this app via the API
+     * @param string $state An arbitrary value used to uniquely identify a user's session
+     * @return string URL that must be clicked on to validate and authorize this module
+     */
+    private static function getAuthorizationURL($clientId, $redirectURI, $scope, $state) {
+        // Create authorization URL
+        $baseURL = "https://authz.constantcontact.com/oauth2/default/v1/authorize";
+        $authURL = $baseURL . "?client_id=" . $clientId . "&scope=" . $scope . "+offline_access&response_type=code&state=" . $state . "&redirect_uri=" . rawurlencode($redirectURI);
+
+        return $authURL;
+    }
+
+    /**
+     * Retrieves initial token values for our app from the API
+     * @param $redirectURI - URL Encoded URL to return to after the external authorization handshake (i.e.: this module's configuration page)
+     * @param $clientId - API Key
+     * @param $clientSecret - API Secret
+     * @param $code - The API app's authorization code as retrieved from the authorization request (ex: getAuthorizationURL)
+     * @return string - JSON String of results, may also be a JSON string containing error data
+     */
+    private static function getNewTokens($redirectURI, $clientId, $clientSecret, $code) {
+        // Use cURL to get access token and refresh token
+        $ch = curl_init();
+
+        // Define base URL
+        $base = 'https://authz.constantcontact.com/oauth2/default/v1/token';
+
+        // Create full request URL
+        $url = $base . '?code=' . $code . '&redirect_uri=' . $redirectURI . '&grant_type=authorization_code';
+        curl_setopt($ch, CURLOPT_URL, $url);
+
+        // Set authorization header
+        $authorization = 'Authorization: Basic ' . base64_encode("{$clientId}:{$clientSecret}");
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array($authorization, 'Content-Type: application/x-www-form-urlencoded'));
+
+        // Set method and to expect response
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+        // Make the call
+        $result = curl_exec($ch);
+        curl_close($ch);
+        return $result;
+    }
+
+    /**
+     * Retrieves a new token value when the prior has expired
+     * @param $refreshToken - The refresh token provided with the previous access token (ex: getNewTokens)
+     * @param $clientId - API Key
+     * @param $clientSecret - API Secret
+     * @return string - JSON String of results, may also be a JSON string containing error data
+     */
+    private static function refreshTokens($refreshToken, $clientId, $clientSecret) {
+        // Use cURL to get a new access token and refresh token
+        $ch = curl_init();
+
+        // Define base URL
+        $base = 'https://authz.constantcontact.com/oauth2/default/v1/token';
+
+        // Create full request URL
+        $url = $base . '?refresh_token=' . $refreshToken . '&grant_type=refresh_token';
+        curl_setopt($ch, CURLOPT_URL, $url);
+
+        // Set authorization header
+        // Make string of "API_KEY:SECRET" and Base64 encode it
+        // Create and set the Authorization header to use the encoded credentials, and set the Content-Type header
+        $authorization = 'Authorization: Basic ' . base64_encode("{$clientId}:{$clientSecret}");
+        curl_setopt($ch, CURLOPT_HTTPHEADER, array($authorization, 'Content-Type: application/x-www-form-urlencoded'));
+
+        // Set method and to expect response
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+        // Make the call
+        $result = curl_exec($ch);
+        curl_close($ch);
+        return $result;
+    }
+
+    // static method, so it can get called from static function getModuleConfigInputfields, but also from within your template files
+    /**
+     * Retrieves up to the first 50 contact lists of an account to choose a default during module configuration
+     * @return boolean|object Will return falser on error, or a JSON decoded object on success
+     */
+    public static function getAvailableContactLists() {
+        // Define the base URL
+        $api = self::API_BASE . '/contact_lists?' . http_build_query([
+            'include_membership_count' => 'active',
+            'status'                   => 'active'
+        ]);
+
+        // Retrieve current data so we can reference it
+        $data = wire()->modules->getConfig('SubscribeToConstantContact');
+        
+        // Use cURL to get available contact lists from the account
+        $ch = curl_init();
+
+        // Set authorization and accept headers
+        $header = array();
+        $header[] = 'Accept: */*';
+        $header[] = 'Content-Type: application/json';
+        $header[] = 'Authorization: Bearer ' . $data['access_token'];
+        $header[] = 'Cache-Control: no-cache';
+        curl_setopt($ch, CURLOPT_URL, $api);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, $header);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'GET');
+
+        $response = curl_exec($ch);
+        $response = $response ? json_decode($response) : false;
+        return $response;
+    }
+
+    /**
+     * Checks the access tokens for expiry, and if necessary will refresh the tokens as needed
+     * @return void
+     */
+    protected function checkToken() {
+        // Access tokens expire in 24 hours; refresh tokens in 180 days
+        // (https://community.constantcontact.com/t5/API-Developer-Support/Refresh-token-expiry/m-p/402882)
+
+        // if the token expires in 5 minutes, or less, refresh it
+        if (time() + (60 * 5) > ($this->token_acquired + $this->access_token_lifetime)) {
+            $result = json_decode(self::refreshTokens($this->refresh_token, $this->api_key, $this->client_secret));
+            echo '<textarea>'.print_r($result,1).'</textarea>';
+
+            // Retrieve current data so we can update it
+            $data = wire()->modules->getConfig('SubscribeToConstantContact');
+
+            // Assign the updated data
+            $data['access_token']          = $result->access_token;
+            $data['refresh_token']         = $result->refresh_token;
+            $data['access_token_lifetime'] = $result->expires_in;
+            $data['token_acquired']        = time();
+
+            // Save updates back to the database
+            wire()->modules->saveConfig('SubscribeToConstantContact', $data);
+        }
+        // ??? https://processwire.com/api/ref/modules/save-config/
+    }
+
+    /**
+     * A method accessible by LazyCron to check the access tokens for expiry and, if necessary, will refres the tokens as needed
+     * @return void
+     */
+    public static function checkTokenCron() {
+        // Access tokens expire in 24 hours; refresh tokens in 180 days
+        // (https://community.constantcontact.com/t5/API-Developer-Support/Refresh-token-expiry/m-p/402882)
+
+        // Retrieve current data so we can check/update it
+        $data = wire()->modules->getConfig('SubscribeToConstantContact');
+
+        if (!$data || !$data['token_acquired']) {
+            return;
+        }
+
+        // if the token expires in 5 minutes, or less, refresh it
+        if (time() + (60 * 5) > ($data['token_acquired'] + $data['access_token_lifetime'])) {
+            $result = json_decode(self::refreshTokens($data['refresh_token'], $data['api_key'], $data['client_secret']));
+
+            // Assign the updated data
+            $data['access_token']          = $result->access_token;
+            $data['refresh_token']         = $result->refresh_token;
+            $data['access_token_lifetime'] = $result->expires_in;
+            $data['token_acquired']        = time();
+
+            // Save updates back to the database
+            wire()->modules->saveConfig('SubscribeToConstantContact', $data);
+        }
+        // ??? https://processwire.com/api/ref/modules/save-config/
+    }
+
+    /**
+     * If provided an email, will attempt to add the email to a contact list as a subscriber
+     * @param String $email The only required field for this method
+     * @param String|null|Array $list Contact list ID(s) to be subscribed to
+     * @param Array $params Optional values associated to a contact's email address; for more information see 
+     * https://developer.constantcontact.com/api_guide/contacts_create_or_update.html#method-request-body
+     * @return object - JSON String of results or false on failure
+     */
+    public function subscribe($email, $list = null, array $params = []) {
+        // Sanitize the email, just in case
+        $email = sanitizer()->email($email);
+
+        // use default 'contact list' from module settings, if no 'contact list' is provided
+        $list = $list ?? $this->default_contact_list;
+
+        // If we still don't have a list (or email contact) to save to, exit processing
+        if (!$list || !$email) return false;
+
+        $default_params = [
+            'first_name'     => null, // max-length 50
+            'last_name'      => null, // max-length 50
+            'job_title'      => null, // max-length 50
+            'company_name'   => null, // max-length 50
+            'phone_number'   => null, // max-length 50
+            'anniversary'    => null, // MM/DD/YYYY, M/D,YYY, YYYY/MM/DD, YYYY/M/D, YYYY-MM-DD, YYYY-M-D, M-D-YYYY, M-DD-YYYY
+            'birthday_month' => null, // 1-12 (required if using birthday day)
+            'birthday_day'   => null, // 1-31 (required if using birthday month)
+            'street_address' => null, // array indeces: kind, street, city, state, postal_code, country
+            'custom_fields'  => null  // custom array of objects, objects must contain the custom_field_id and value
+        ];
+        if ($params) {
+            // Remove keys that aren't found in both
+            $params = array_intersect_key($params, $default_params);
+            // Remove any empty values
+            $params = array_filter($params);
+        }
+
+        if (isset($email)) {
+            $this->checkToken();
+            $api = self::API_BASE . '/contacts/sign_up_form';
+
+            // The API expects the $list value to be in the form of an array
+            if (!is_array($list)) {
+                $list = [$list];
+            }
+
+            // Set the body of the POST request
+            $payload = [
+                'email_address' => $email,
+                'list_memberships' => $list
+            ];
+            if ($params) {
+                $payload = array_merge($payload, $params);
+            }
+            $payload = json_encode($payload);
+
+            // Begin cURL call
+            $ch = curl_init();
+            curl_setopt($ch, CURLOPT_URL, $api);
+
+            // Set authorization and accept headers
+            $header = array();
+            $header[] = 'Content-Type: application/json';
+            $header[] = 'Authorization: Bearer ' . $this->access_token;
+            $header[] = 'Cache-Control: no-cache';
+            curl_setopt($ch, CURLOPT_HTTPHEADER, $header);
+
+            // Set method and to expect response
+            curl_setopt($ch, CURLOPT_POST, true);
+            curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+            // Assign the data
+            curl_setopt($ch, CURLOPT_POSTFIELDS, $payload);
+
+            // Make the call and close the connection
+            $result = curl_exec($ch);
+            curl_close($ch);
+
+            if ($result !== false) {
+                $this->errorMessage = null;
+                return $result;
+            } else {
+                // Log warning in ProcessWire backend
+                $this->warning("Constant Contact subscribe() not successful: " . curl_error($ch), Notice::log);
+                return false;
+            }
+        } else {
+            // Log warning, if a user is able to send a form without email.
+            $this->warning(self::WARNING_VALIDATION);
+            return false;
+        }
+    }
+
+    /**
+     * Attempts to look up account details of a subscriber in the Constant Contact account by an email address
+     * @param string $email A valid email address to look up in the associated Constant Contact account
+     * @return boolean|object On success will return a JSON decoded object, on failure will return false
+     * @throws WireException 
+     */
+    private function getContact($email) {
+        // Sanitize the email
+		$email = sanitizer()->email($email);
+        if (!$email) return false;
+
+        $curl = curl_init();
+
+        curl_setopt_array($curl, array(
+            CURLOPT_URL => self::API_BASE . '/contacts?email=' . urlencode($email),
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_ENCODING => '',
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_TIMEOUT => 0,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_CUSTOMREQUEST => 'GET',
+            CURLOPT_HTTPHEADER => array(
+                'Accept: */*',
+                'Content-Type: application/json',
+                'Authorization: Bearer ' . $this->access_token
+            ),
+        ));
+
+        $response = curl_exec($curl);
+        $info = curl_getinfo($curl);
+
+        if (!$response || $info['http_code'] != 200) {
+            $this->warning("Constant Contact getContact() not successful: " . curl_error($curl), Notice::log);
+            return false;
+        }
+
+        $this->errorMessage = null;
+        curl_close($curl);
+        return json_decode($response);
+    }
+
+    // Unsubscribe in Constant Contact is for an account that does not want to receive any emails, unsubscribed contaxts
+    // cannot be sent mail until or unless the contact chooses to be resubscribed through a sign-up form.
+    // Account attribute in Contant Contact: permission_to_send=unsubscribed
+    // Unsubscribed accounts do not count against the number of active contacts for an account (pricing)
+    /**
+     * Changes the status of a contact to unsubscribed, these contacts can no longer be emailed until/unless they re-submit a signup form
+     * @param string $email A valid email address to look up in the associated Constant Contact account
+     * @return bool Returns true on success, false on failure
+     */
+    public function unsubscribe(string $email) {
+        $email = sanitizer()->email($email);
+        $id = null;
+        if (!$email) return false;
+
+        if (isset($email)) {
+            $contact = $this->getContact($email);
+            if (!isset($contact->contacts)) {
+                return false;
+            } else if ($contact && !count($contact->contacts)) {
+                $this->warning("Constant Contact unsubscribe() not successful; contact not found: " . $email, Notice::log);
+                $this->errorMessage = 'Not found.';
+                return false;
+            }
+            
+            $contact = $contact->contacts[0];
+            $id = $contact->contact_id;
+            $api = self::API_BASE . '/contacts/' . $id;
+            
+            $json = '{
+                "email_address": {
+                    "address": "'.$email.'",
+                    "permission_to_send": "unsubscribed",
+                    "opt_out_reason":""
+                },
+                "update_source": "Contact"
+            }';
+
+            $curl = curl_init();
+            curl_setopt_array($curl, array(
+                CURLOPT_URL => $api,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_ENCODING => '',
+                CURLOPT_MAXREDIRS => 10,
+                CURLOPT_TIMEOUT => 0,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+                CURLOPT_CUSTOMREQUEST => 'PUT',
+                CURLOPT_POSTFIELDS => $json,
+                CURLOPT_HTTPHEADER => array(
+                    'Accept: application/json',
+                    'Authorization: Bearer ' . $this->access_token,
+                    'Cache-Control: no-cache',
+                    'Content-Type: application/json',
+                    'Cotnent-Length: ' . strlen($json)
+                )
+            ));
+            $response = curl_exec($curl);
+            curl_close($curl);
+
+            if ($response !== false) {
+                $this->errorMessage = null;
+                return true;
+            } else {
+                // Log warning in ProcessWire backend
+                $this->warning("Constant Contact unsubscribe() not successful: " . curl_error($curl), Notice::log);
+                return false;
+            }
+        } else {
+            // Log warning, if a user is able to send a form without email.
+            $this->warning(self::WARNING_VALIDATION);
+            return false;
+        }
+    }
+
+    // Deletion in ConstantContact removes contact lists to associated accounts; it will not prevent imported CSV lists of 
+    // contacts from being resubscribed; use unsubscribe to prevent automatic resubscription if a user initiated the request
+    // user attribute in Constant Contact: status=deleted; deleted_at=<timestamp>
+    // Deleted accounts do not count against the number of active contacts for an account (pricing)
+    /**
+     * 
+     * @param mixed $email A valid email address to look up in the associated Constant Contact account
+     * @return bool Returns true on success, false on failure
+     */
+    public function delete($email) {
+        $email = sanitizer()->email($email);
+        $id = null;
+        if (!$email) return false;
+
+        if (isset($email)) {
+            $contact = $this->getContact($email);
+            if (!isset($contact->contacts)) {
+                return false;
+            } else if ($contact && !count($contact->contacts)) {
+                $this->warning("Constant Contact delete() not successful; contact not found: " . $email, Notice::log);
+                $this->errorMessage = 'Not found.';
+                return false;
+            }
+            
+            $contact = $contact->contacts[0];
+            $id = $contact->contact_id;
+            $api = self::API_BASE . '/contacts/' . $id;
+
+            $curl = curl_init();
+            curl_setopt_array($curl, array(
+                CURLOPT_URL => $api,
+                CURLOPT_RETURNTRANSFER => true,
+                CURLOPT_ENCODING => '',
+                CURLOPT_MAXREDIRS => 10,
+                CURLOPT_TIMEOUT => 0,
+                CURLOPT_FOLLOWLOCATION => true,
+                CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+                CURLOPT_CUSTOMREQUEST => 'DELETE',
+                CURLOPT_HTTPHEADER => array(
+                    'Accept: application/json',
+                    'Authorization: Bearer ' . $this->access_token,
+                    'Cache-Control: no-cache',
+                    'Content-Type: application/json'
+                )
+            ));
+            $response = curl_exec($curl);
+            curl_close($curl);
+            $info = curl_getinfo($curl);
+
+            if ($info['http_code'] == 204) {
+                $this->errorMessage = null;
+                return true;
+            }
+
+            if ($response !== false) {
+                // I don't think this will ever be entered...
+                return true;
+            } else {
+                // Log warning in ProcessWire backend
+                $this->warning("Constant Contact delete() not successful: " . curl_error($curl), Notice::log);
+                return false;
+            }
+        } else {
+            // Log warning, if a user is able to send a form without email.
+            $this->warning(self::WARNING_VALIDATION, Notice::log);
+            return false;
+        }
+    }
+
+    /**
+     * Removes the association of contacts from lists
+     * @param string|array An email that is to be removed from a list or lists
+     * @param mixed $list A list ID, or array of list IDs to remove from the contact(s); if null, the default list will be used
+     * @return bool Returns true on success or false on failure
+     */
+    public function removeFromList(string $email, $list = null) {
+        $email = sanitizer()->email($email);
+        $id = null;
+        
+        // Use default 'contact list' from module settings, if no 'contact list' is provided
+        $list = $list ?? $this->default_contact_list;
+        // Convert the list to an array
+        if (!is_array($list)) {
+            $list = [$list];
+        }
+
+        if (!$email || !$list) return false;
+        
+        $contact = $this->getContact($email);
+        if (!isset($contact->contacts)) {
+            return false;
+        } else if ($contact && !count($contact->contacts)) {
+            $this->warning("Constant Contact removeFromList() not successful; contact not found: " . $email, Notice::log);
+            $this->errorMessage = 'Not found.';
+            return false;
+        }
+        
+        $contact = $contact->contacts[0];
+        $id = $contact->contact_id;
+        $api = self::API_BASE . '/activities/remove_list_memberships' . 'id';
+
+        $payload = json_encode([
+            'source' => [
+                'contact_ids' => [$id]
+            ],
+            'list_ids' => $list
+        ]);
+
+        $curl = curl_init();
+        curl_setopt_array($curl, array(
+            CURLOPT_URL => $api,
+            CURLOPT_RETURNTRANSFER => true,
+            CURLOPT_ENCODING => '',
+            CURLOPT_MAXREDIRS => 10,
+            CURLOPT_TIMEOUT => 0,
+            CURLOPT_FOLLOWLOCATION => true,
+            CURLOPT_HTTP_VERSION => CURL_HTTP_VERSION_1_1,
+            CURLOPT_POST => true,
+            CURLOPT_POSTFIELDS => $payload,
+            CURLOPT_HTTPHEADER => array(
+                'Accept: application/json',
+                'Authorization: Bearer ' . $this->access_token,
+                'Cache-Control: no-cache',
+                'Content-Type: application/json'
+            )
+        ));
+        $response = curl_exec($curl);
+        curl_close($curl);
+        $info = curl_getinfo($curl);
+        
+        if ($response !== false && $info['http_code'] == 201) {
+            $this->errorMessage = null;
+            return true;
+        } else {
+            $codes = [
+                400 => 'Bad request. Either the JSON was malformed or there was a data validation error.',
+                401 => 'The access token used is invalid.',
+                403 => 'Forbidden request. You lack the necessary scopes, you lack the necessary user privileges, or the application is deactivated.',
+                404 => 'The requested resource was not found.',
+                429 => 'Too many requests. You exceeded 1,000 queued activities for this user account.',
+                500 => 'There was a problem with the Constant Contact internal service.',
+                503 => 'The Constant Contact service is temporarily unavailable.'
+            ];
+            $this->errorMessage = $codes[$info['http_code']];
+            $this->warning($this->errorMessage, Notice::log);
+            return false;
+        }
+    }
+
+    /**
+     * Provide configurable data and related fields for the module
+     * @param mixed $data The values for the fields when submitted
+     * @return InputfieldWrapper Contains all of the form fields and related values
+     */
+    public function getModuleConfigInputfields($data = null) {
+        $wrap = new InputfieldWrapper();
+        $form = wire('modules')->get('InputfieldFieldset');
+        $form->label = __('Constant Contact Configuration');
+        // $form->notes = __('Check out the README, if you have trouble finding the data for the fields above.');
+
+        // Generate the current URL for redirecting back to
+        $protocol = wire()->config->https ? 'https://' : 'http://';
+        $module_config_url = $protocol . wire()->config->httpHost . wire()->config->urls->admin . 'module/edit?name=' . self::className();
+
+        if (empty($data)) {
+            $inputfields = [
+                'redirect_uri' => [
+                    'label' => __('Constant Contact\'s API Application "Redirect URL"'),
+                    'readonly' => "true",
+                    'value' => $module_config_url,
+                    'columnWidth' => 100,
+                    'collapse' => false,
+                    'description' => __('Constant Contact will need this for its redirect URL setting:')
+                ],
+                'api_key' => [
+                    'label' => __('API Key / Client ID'),
+                    'required' => true
+                ],
+                'client_secret' => [
+                    'label' => __('Client Secret'),
+                    'required' => true
+                ]
+            ];
+            $hiddenFields = [
+                'access_token' => [
+                    'label' => __('Access Token')
+                ],
+                'refresh_token' => [
+                    'label' => __('Refresh Token')
+                ],
+                'token_acquired' => [
+                    'label' => __('Token Acquired Time')
+                ],
+                'access_token_lifetime' => [
+                    'label' => __('Access Token Lifetime')
+                ],
+                'default_contact_list' => [
+                    'label' => __('Default Contact List')
+                ],
+                'last_used' => [
+                    'label' => __('Last Used')
+                ]
+            ];
+            $checkboxfields = [];
+
+            $f = wire('modules')->get("InputfieldMarkup");
+            $f->attr('name', 'config_intro');
+            $f->label = __('CONFIGURATION SETUP: STEP 1');
+            $f->value = "<p>To enable this module, you must first:</p> <ol><li>Have a Constant Contact <a href='https://developer.constantcontact.com/api_guide/getting_started.html#step-1-sign-up-or-log-in'>developer account</a></li><li><a href='https://app.constantcontact.com/pages/dma/portal/'>Register an application</a> using the <em>Application OAuth2 Settings</em>:<ul><li>Authorization Code Flow and Implicit Flow</li><li>Rotating Refresh Tokens</li></ul></li><li>Copy and paste the generated API Key, and Client Secret, from your application below.</li></ol><p>You may have to edit the app to generate a Client Secret.</p>";
+            $form->append($f);
+
+            foreach ($inputfields as $name => $attributes) {
+                $f = wire('modules')->get('InputfieldText');
+                $f->attr('name', $name);
+                $f->label = $attributes['label'];
+                $f->required = $attributes['required'] ?? false;
+                $f->columnWidth = $attributes['columnWidth'] ?? 50;
+                if (isset($attributes['readonly'])) {
+                    $f->attr('readonly', $attributes['readonly']);
+                }
+                if (isset($attributes['value'])) {
+                    $f->attr('value', $attributes['value']);
+                } else if (isset($data[$name])) {
+                    $f->attr('value', $data[$name]);
+                }
+                if (isset($attributes['collapse']) && !$attributes['collapse']) {
+                    $f->collapsed(Inputfield::collapsedNoLocked);
+                } else {
+                    $f->collapsed(Inputfield::collapsedPopulated);
+                }
+                if (isset($attributes['description'])) {
+                    $f->description = $attributes['description'];
+                }
+                if (isset($attributes['notes'])) {
+                    $f->notes = $attributes['notes'];
+                }
+                $form->append($f);
+            }
+            foreach ($hiddenFields as $name => $label) {
+                $f = wire('modules')->get('InputfieldHidden');
+                $f->attr('name', $name);
+                if (isset($data[$name])) {
+                    $f->attr('value', $data[$name]);
+                }
+                $form->add($f);
+            }
+        } else if (empty($data['refresh_token'])  && !isset($_GET['code'])) {
+            // Config Step 2
+
+            // Generate the URL to link to Constant Contact's manual API application authorization to display
+            $auth_url = self::getAuthorizationURL($data['api_key'], $module_config_url, rawurlencode(implode(' ', self::CTCT_SCOPES)), session_id());
+            $f = wire('modules')->get("InputfieldMarkup");
+            $f->attr('name', 'config_intro');
+            $f->label = __('CONFIGURATION SETUP: STEP 2');
+            $f->value = "<p><a href='{$auth_url}'>Authorize and connect this module to your Constant Contact application</a> following the instructions. You will be redirected back to this module's configuration page.</p>";
+            $form->append($f);
+
+            $inputfields = [
+                'redirect_uri' => [
+                    'label' => __('Constant Contact\'s API Application "Redirect URL"'),
+                    'readonly' => "true",
+                    'value' => $module_config_url,
+                    'columnWidth' => 100,
+                    'collapse' => false,
+                    'description' => __('Constant Contact will need this for its redirect URL setting:')
+                ],
+                'api_key' => [
+                    'label' => __('API Key / Client ID'),
+                    'required' => true
+                ],
+                'client_secret' => [
+                    'label' => __('Client Secret'),
+                    'required' => true
+                ]
+            ];
+            $hiddenFields = [
+                'access_token' => [
+                    'label' => __('Access Token')
+                ],
+                'refresh_token' => [
+                    'label' => __('Refresh Token')
+                ],
+                'token_acquired' => [
+                    'label' => __('Token Acquired Time')
+                ],
+                'access_token_lifetime' => [
+                    'label' => __('Access Token Lifetime')
+                ],
+                'default_contact_list' => [
+                    'label' => __('Default Contact List')
+                ],
+                'last_used' => [
+                    'label' => __('Last Used')
+                ]
+            ];
+            $checkboxfields = [
+                // 'double_opt_in' => __('Use double opt in. (Recommended)'),
+            ];
+            foreach ($inputfields as $name => $attributes) {
+                $f = wire('modules')->get('InputfieldText');
+                $f->attr('name', $name);
+                $f->label = $attributes['label'];
+                $f->required = $attributes['required'] ?? false;
+                $f->columnWidth = $attributes['columnWidth'] ?? 50;
+                if (isset($attributes['readonly'])) {
+                    $f->attr('readonly', $attributes['readonly']);
+                }
+                if (isset($attributes['value'])) {
+                    $f->attr('value', $attributes['value']);
+                } else if (isset($data[$name])) {
+                    $f->attr('value', $data[$name]);
+                }
+                if (isset($attributes['collapse']) && !$attributes['collapse']) {
+                    $f->collapsed(Inputfield::collapsedNoLocked);
+                } else {
+                    $f->collapsed(Inputfield::collapsedPopulated);
+                }
+                if (isset($attributes['description'])) {
+                    $f->description = $attributes['description'];
+                }
+                if (isset($attributes['notes'])) {
+                    $f->notes = $attributes['notes'];
+                }
+                $form->add($f);
+            }
+            foreach ($hiddenFields as $name => $label) {
+                $f = wire('modules')->get('InputfieldHidden');
+                $f->attr('name', $name);
+                if (isset($data[$name])) {
+                    $f->attr('value', $data[$name]);
+                }
+                $form->add($f);
+            }
+            foreach ($checkboxfields as $name => $label) {
+                $f = wire('modules')->get("InputfieldCheckbox");
+                $f->name = $name;
+                $f->label = $label;
+                $f->attr('checked', empty($data[$name]) ? '' : 'checked');
+                $f->columnWidth = 100;
+                $form->add($f);
+            }
+        } else if (empty($data['refresh_token'])) {
+            // Config Step 3 - no user interaction; we now have the data to get our API tokens
+            $code = $_GET['code'];
+            $state = $_GET['state'];
+
+            // Security error with session id matching
+            // if ($state != session_id()) {
+            //     die('Error in transit. Session does not match.');
+            // }
+
+            $tokens = json_decode(self::getNewTokens($module_config_url, $data['api_key'], $data['client_secret'], $code));
+            if (isset($tokens->error)
+                && $tokens->error == 'invalid_grant'
+                && $tokens->error_description == 'The authorization code is invalid or has expired.') {
+                // The API application must be reauthorized; this usually only happens during development/testing
+                // Generate the URL to link to Constant Contact's manual API application authorization to display
+                $auth_url = self::getAuthorizationURL($data['api_key'], $module_config_url, rawurlencode(implode(' ', self::CTCT_SCOPES)), session_id());
+                $f = wire('modules')->get("InputfieldMarkup");
+                $f->attr('name', 'config_intro');
+                $f->label = __('CONFIGURATION: REAUTHENTICATE');
+                $f->value = "<p><strong>Out-of-Sync Error:</strong> <a href='{$auth_url}'>Reauthorize and reconnect this module to your Constant Contact application</a>.</p>";
+                $form->append($f);
+            } else {
+                // Instruct to save the form (Submit)
+                // TODO: Fix this manual necessity... this is dumb
+                $f = wire('modules')->get("InputfieldMarkup");
+                $f->attr('name', 'config_intro');
+                $f->label = __('CONFIGURATION SETUP: STEP 3');
+                $f->value = "<p><strong>SUBMIT the settings to save the current configuration data.</strong></p>";
+                $form->append($f);
+
+                // Our data is still in sync
+                $access_token   = $tokens->access_token;
+                $refresh_token  = $tokens->refresh_token;
+                $token_acquired = time();
+                $token_lifetime = $tokens->expires_in; // time when the access token expires; refresh tokens expire after 180 days
+
+                $data['access_token'] = $access_token;
+                $data['refresh_token'] = $refresh_token;
+                $data['token_acquired'] = $token_acquired;
+                $data['access_token_expiry'] = $token_expires;
+
+                $inputfields = [
+                    'redirect_uri' => [
+                        'label' => __('Constant Contact\'s API Application "Redirect URL"'),
+                        'readonly' => "true",
+                        'value' => $module_config_url,
+                        'columnWidth' => 100,
+                        'collapse' => true,
+                        'description' => __('Constant Contact will need this for its redirect URL setting:')
+                    ],
+                    'api_key' => [
+                        'label' => __('API Key / Client ID'),
+                        'required' => true
+                    ],
+                    'client_secret' => [
+                        'label' => __('Client Secret'),
+                        'required' => true
+                    ],
+                    'access_token' => [
+                        'label' => __('Access Token'),
+                        'value' => $access_token,
+                        'required' => true
+                    ],
+                    'refresh_token' => [
+                        'label' => __('Refresh Token'),
+                        'value' => $refresh_token,
+                        'required' => true
+                    ],
+                    'token_acquired' => [
+                        'label' => __('Token Acquired Time'),
+                        'value' => $token_acquired,
+                        'required' => true
+                    ],
+                    'access_token_lifetime' => [
+                        'label' => __('Access Token Lifetime'),
+                        'value' => $token_lifetime,
+                        'required' => true
+                    ]
+                ];
+                $hiddenFields = [
+                    'default_contact_list' => [
+                        'label' => __('Default Contact List')
+                    ],
+                    'last_used' => [
+                        'label' => __('Last Used')
+                    ]
+                ];
+                foreach ($inputfields as $name => $attributes) {
+                    $f = wire('modules')->get('InputfieldText');
+                    $f->attr('name', $name);
+                    $f->label = $attributes['label'];
+                    $f->required = $attributes['required'] ?? false;
+                    $f->columnWidth = $attributes['columnWidth'] ?? 50;
+                    if (isset($attributes['readonly'])) {
+                        $f->attr('readonly', $attributes['readonly']);
+                    }
+                    if (isset($attributes['value'])) {
+                        $f->attr('value', $attributes['value']);
+                    } else if (isset($data[$name])) {
+                        $f->attr('value', $data[$name]);
+                    }
+                    if (isset($attributes['collapse']) && !$attributes['collapse']) {
+                        $f->collapsed(Inputfield::collapsedNoLocked);
+                    } else {
+                        $f->collapsed(Inputfield::collapsedPopulated);
+                    }
+                    if (isset($attributes['description'])) {
+                        $f->description = $attributes['description'];
+                    }
+                    if (isset($attributes['notes'])) {
+                        $f->notes = $attributes['notes'];
+                    }
+                    $form->add($f);
+                }
+                foreach ($checkboxfields as $name => $label) {
+                    $f = wire('modules')->get("InputfieldCheckbox");
+                    $f->name = $name;
+                    $f->label = $label;
+                    $f->attr('checked', empty($data[$name]) ? '' : 'checked');
+                    $f->columnWidth = 100;
+                    $form->add($f);
+                }
+                foreach ($hiddenFields as $name => $label) {
+                    $f = wire('modules')->get('InputfieldHidden');
+                    $f->attr('name', $name);
+                    if (isset($data[$name])) {
+                        $f->attr('value', $data[$name]);
+                    }
+                    $form->add($f);
+                }
+            }
+        } else {
+            // Initial configuration completed.
+
+            $access_token_expiration = date('c', $data['token_acquired'] + $data['access_token_lifetime']);
+            $refresh_token_expiration = date('c', strtotime('+180 days', $data['token_acquired']));
+            $f = wire('modules')->get("InputfieldMarkup");
+            $f->attr('name', 'config_intro');
+            $f->label = __('Token Expirations');
+            $f->value = "<p><dl><dt>Access Token</dt><dd>{$access_token_expiration}</dd><dt>Refresh Token</dt><dd>{$refresh_token_expiration}</dd></dl></p>";
+            $form->append($f);
+
+            // Check for contact lists
+            $lists = self::getAvailableContactLists();
+            $contact_list = [
+                'label' => __('Default Contact List'),
+                'columnWidth' => 100,
+                'description' => __('Set a default contact list that this module will manage. This can be overridden.'),
+                'type' => 'text',
+                'notes' => __('If the module has been configured and you have multiple contact lists but are only seeing a text field here, refresh the page. Your access token needed to be refreshed.')
+            ];
+            if ($lists) {
+                $lists = $lists->lists;
+                $contact_list['type'] = 'select';
+                $select_options = [];
+                foreach ($lists as $cur_list) {
+                    $select_options[$cur_list->list_id] = "{$cur_list->name} - ({$cur_list->membership_count} " . __('members') . ')';
+                }
+                $contact_list['options'] = $select_options;
+                unset($contact_list['notes']);
+            }
+
+            $inputfields = [
+                'redirect_uri' => [
+                    'label' => __('Constant Contact\'s API Application "Redirect URL"'),
+                    'readonly' => "true",
+                    'value' => $module_config_url,
+                    'columnWidth' => 100,
+                    // 'collapse' => false,
+                    'description' => __('Constant Contact will need this for its redirect URL setting:')
+                ],
+                'api_key' => [
+                    'label' => __('API Key / Client ID'),
+                    'required' => true
+                ],
+                'client_secret' => [
+                    'label' => __('Client Secret'),
+                    'required' => true
+                ],
+                'default_contact_list' => $contact_list
+            ];
+            $hiddenFields = [
+                'access_token' => [
+                    'label' => __('Access Token')
+                ],
+                'refresh_token' => [
+                    'label' => __('Refresh Token')
+                ],
+                'token_acquired' => [
+                    'label' => __('Token Acquired Time')
+                ],
+                'access_token_lifetime' => [
+                    'label' => __('Access Token Lifetime')
+                ],
+                'last_used' => [
+                    'label' => __('Last Used')
+                ]
+            ];
+
+            foreach ($inputfields as $name => $attributes) {
+                if (isset($attributes['type']) && $attributes['type'] == 'select') {
+                    $f = wire('modules')->get('InputfieldSelect');
+                    foreach ($attributes['options'] as $select_option_val => $select_option_text) {
+                        $f->addOption($select_option_val, $select_option_text);
+                    }
+                } else {
+                    $f = wire('modules')->get('InputfieldText');
+                }
+                $f->attr('name', $name);
+                $f->label = $attributes['label'];
+                $f->required = $attributes['required'] ?? false;
+                $f->columnWidth = $attributes['columnWidth'] ?? 50;
+                if (isset($attributes['readonly'])) {
+                    $f->attr('readonly', $attributes['readonly']);
+                }
+                if (isset($attributes['value'])) {
+                    $f->attr('value', $attributes['value']);
+                } else if (isset($data[$name])) {
+                    $f->attr('value', $data[$name]);
+                }
+                if (isset($attributes['collapse']) && !$attributes['collapse']) {
+                    $f->collapsed(Inputfield::collapsedNoLocked);
+                } else {
+                    $f->collapsed(Inputfield::collapsedPopulated);
+                }
+                if (isset($attributes['description'])) {
+                    $f->description = $attributes['description'];
+                }
+                if (isset($attributes['notes'])) {
+                    $f->notes = $attributes['notes'];
+                }
+                $form->append($f);
+            }
+            foreach ($hiddenFields as $name => $label) {
+                $f = wire('modules')->get('InputfieldHidden');
+                $f->attr('name', $name);
+                if (isset($data[$name])) {
+                    $f->attr('value', $data[$name]);
+                }
+                $form->add($f);
+            }
+        }
+
+        $wrap->add($form);
+        return $wrap;
+    }
+}

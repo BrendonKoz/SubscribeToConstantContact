@@ -1,0 +1,17 @@
+{
+    "title": "Subscribe to Constant Contact",
+    "version": "0.0.1",
+    "summary": "Subscribe or unsubscribe (or delete) a user in your Constant Contact mailing list(s).",
+    "author": "Brendon Kozlowski",
+    "icon": "address-card",
+    "autoload": false,
+    "singular": true,
+    "permanent": false,
+    "requires": [
+        "PHP>=8.0.0",
+        "ProcessWire>=3.0.229"
+    ],
+    "installs": [
+        "SubscribeToConstantContactKeepAlive"
+    ]
+}
