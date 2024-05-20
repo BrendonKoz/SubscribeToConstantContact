@@ -1,5 +1,6 @@
 # SubscribeToConstantContact
-A lightweight module for the [ProcessWire CMS/CMF](https://processwire.com/) that lets you subscribe a user to a [Constant Contact](https://www.constantcontact.com/) list.
+A lightweight module for the [ProcessWire CMS/CMF](https://processwire.com/) that lets you subscribe a user to a [Constant Contact](https://www.constantcontact.com/) list.\
+_Heavily inspired by [SubscribeToMailchimp](https://github.com/danielstieber/SubscribeToMailchimp)._
 
 ## The basic idea
 ```php
