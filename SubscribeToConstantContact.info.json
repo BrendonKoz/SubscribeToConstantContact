@@ -3,6 +3,7 @@
     "version": "0.0.1",
     "summary": "Subscribe or unsubscribe (or delete) a user in your Constant Contact mailing list(s).",
     "author": "Brendon Kozlowski",
+	"href": "https://github.com/BrendonKoz/SubscribeToConstantContact",
     "icon": "address-card",
     "autoload": false,
     "singular": true,
