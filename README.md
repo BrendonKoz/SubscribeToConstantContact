@@ -86,7 +86,7 @@ If you have enabled double opt-in in your Constant Contact settings, you will no
 
 Go to the [Constant Contact Developer Documentation](https://developer.constantcontact.com/api_guide/index.html) for more information.
 
-\*I have only done minimal testing on this module, so use with caution
+\*I have only done minimal testing on this module, so use with caution, and please report any bugs related to the stated purpose of the module.
 
 ## Contribution
 Pull requests welcome. (Especially for the awkward module setup/configuration flow.)
