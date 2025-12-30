@@ -5,8 +5,8 @@ _Heavily inspired by [SubscribeToMailchimp](https://github.com/danielstieber/Sub
 ## The basic idea
 ```php
 // Easily subscribe a user with SubscribeToConstantContact
-$mc = $modules->get("SubscribeToConstantContact");
-$mc->subscribe('email@example.com');
+$mod = $modules->get("SubscribeToConstantContact");
+$mod->subscribe('email@example.com');
 ```
 
 ## How To Install
@@ -31,33 +31,33 @@ _**NOTE:** The client secret may need to be recreated to retrieve it._
 ## Usage
 ```php
 // load module into template
-$mc = $modules->get("SubscribeToConstantContact");
+$mod = $modules->get("SubscribeToConstantContact");
 
  // subscribe / update a user in your default audience
-$mc->subscribe('email@example.com');
+$mod->subscribe('email@example.com');
 
 // add additional fields to fill out user data
 // subscribe($email, $list_id, $parameters)
 // $list_id will default to the module's saved configuration value, if set
 // NOTE: Parameter values are not validated by the module, see the documentation for further info
-$mc->subscribe('email@example.com', null, ['first_name' => 'John', 'last_name' => 'Doe']);
+$mod->subscribe('email@example.com', null, ['first_name' => 'John', 'last_name' => 'Doe']);
 
 // Subscribe a user to a specific list (other than default)
-$mc->subscribe('email@example.com', 'adcdef12345', ['first_name' => 'John', 'last_name' => 'Doe']);
+$mod->subscribe('email@example.com', 'adcdef12345', ['first_name' => 'John', 'last_name' => 'Doe']);
 ```
 
 Additional methods
 ```php
 // Unsubscribe a user
-$mc->unsubscribe('email@example.com');
+$mod->unsubscribe('email@example.com');
 
 // Delete a user. Deleted users still exist in Constant Contact, but cannot be seen (in Constant Contact) or retrieved (via API)
-$mc->delete('email@example.com');
+$mod->delete('email@example.com');
 
 // Unsubscribe a user from a contact list (or array of lists)
-$mc->removeFromList('email@example.com');
-$mc->removeFromList('email@example.com', 'abcdef1356');
-$mc->removeFromList('email@example.com', ['abcdef1356']);
+$mod->removeFromList('email@example.com');
+$mod->removeFromList('email@example.com', 'abcdef1356');
+$mod->removeFromList('email@example.com', ['abcdef1356']);
 
 ```
 
@@ -66,9 +66,9 @@ Example usage after a form is submitted on your page:
 ```php
 // ... validation of form data
 
-$mc = $modules->get("SubscribeToConstantContact");
+$mod = $modules->get("SubscribeToConstantContact");
 $user_email = $sanitizer->email($input->post->email);
-$mc->subscribe($user_email);
+$mod->subscribe($user_email);
 
 ```
 
