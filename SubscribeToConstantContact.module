@@ -56,7 +56,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
 
         // Make the call
         $result = curl_exec($ch);
-        curl_close($ch);
         return $result;
     }
 
@@ -90,7 +89,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
 
         // Make the call
         $result = curl_exec($ch);
-        curl_close($ch);
         return $result;
     }
 
@@ -172,18 +170,20 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
             return;
         }
 
-        // if the token expires in 5 minutes, or less, refresh it
+        // If the token expires in 5 minutes, or less, refresh it
         if (time() + (60 * 5) > ($data['token_acquired'] + $data['access_token_lifetime'])) {
             $result = json_decode(self::refreshTokens($data['refresh_token'], $data['api_key'], $data['client_secret']));
 
-            // Assign the updated data
-            $data['access_token']          = $result->access_token;
-            $data['refresh_token']         = $result->refresh_token;
-            $data['access_token_lifetime'] = $result->expires_in;
-            $data['token_acquired']        = time();
+            if ($result && !(isset($result->error) && $result->error === 'invalid_grant')) {
+                // Assign the updated data
+                $data['access_token']          = $result->access_token;
+                $data['refresh_token']         = $result->refresh_token;
+                $data['access_token_lifetime'] = $result->expires_in;
+                $data['token_acquired']        = time();
 
-            // Save updates back to the database
-            wire()->modules->saveConfig('SubscribeToConstantContact', $data);
+                // Save updates back to the database
+                wire()->modules->saveConfig('SubscribeToConstantContact', $data);
+            }
         }
         // ??? https://processwire.com/api/ref/modules/save-config/
     }
@@ -264,7 +264,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
 
             // Make the call and close the connection
             $result = curl_exec($ch);
-            curl_close($ch);
 
             if ($result !== false) {
                 $this->errorMessage = null;
@@ -319,7 +318,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
         }
 
         $this->errorMessage = null;
-        curl_close($curl);
         return json_decode($response);
     }
 
@@ -341,7 +339,7 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
             $contact = $this->getContact($email);
             if (!isset($contact->contacts)) {
                 return false;
-            } else if ($contact && !count($contact->contacts)) {
+            } elseif ($contact && !count($contact->contacts)) {
                 $this->warning("Constant Contact unsubscribe() not successful; contact not found: " . $email, Notice::log);
                 $this->errorMessage = 'Not found.';
                 return false;
@@ -380,7 +378,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
                 )
             ));
             $response = curl_exec($curl);
-            curl_close($curl);
 
             if ($response !== false) {
                 $this->errorMessage = null;
@@ -415,7 +412,7 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
             $contact = $this->getContact($email);
             if (!isset($contact->contacts)) {
                 return false;
-            } else if ($contact && !count($contact->contacts)) {
+            } elseif ($contact && !count($contact->contacts)) {
                 $this->warning("Constant Contact delete() not successful; contact not found: " . $email, Notice::log);
                 $this->errorMessage = 'Not found.';
                 return false;
@@ -443,7 +440,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
                 )
             ));
             $response = curl_exec($curl);
-            curl_close($curl);
             $info = curl_getinfo($curl);
 
             if ($info['http_code'] == 204) {
@@ -488,7 +484,7 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
         $contact = $this->getContact($email);
         if (!isset($contact->contacts)) {
             return false;
-        } else if ($contact && !count($contact->contacts)) {
+        } elseif ($contact && !count($contact->contacts)) {
             $this->warning("Constant Contact removeFromList() not successful; contact not found: " . $email, Notice::log);
             $this->errorMessage = 'Not found.';
             return false;
@@ -524,7 +520,6 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
             )
         ));
         $response = curl_exec($curl);
-        curl_close($curl);
         $info = curl_getinfo($curl);
         
         if ($response !== false && $info['http_code'] == 201) {
@@ -643,7 +638,7 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
                 }
                 $form->add($f);
             }
-        } else if (empty($data['refresh_token'])  && !isset($_GET['code'])) {
+        } elseif (empty($data['refresh_token'])  && !isset($_GET['code'])) {
             // Config Step 2
 
             // Generate the URL to link to Constant Contact's manual API application authorization to display
@@ -738,7 +733,7 @@ class SubscribeToConstantContact extends WireData implements Module, Configurabl
                 $f->columnWidth = 100;
                 $form->add($f);
             }
-        } else if (empty($data['refresh_token'])) {
+        } elseif (empty($data['refresh_token'])) {
             // Config Step 3 - no user interaction; we now have the data to get our API tokens
             $code = $_GET['code'];
             $state = $_GET['state'];
